@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gitops-demo
+  namespace: argocd
+spec:
+  project: gitops-demo
+  source:
+    repoURL: YOUR_GITOPS_REPO_URL
+    targetRevision: main
+    path: helm/gitops-demo
+    helm:
+      valueFiles:
+        - ../../environments/dev/frontend-values.yaml
+        - ../../environments/dev/backend-values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gitops-demo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

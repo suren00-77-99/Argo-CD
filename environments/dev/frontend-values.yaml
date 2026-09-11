@@ -1,0 +1,4 @@
+frontend:
+  image:
+    repository: YOUR_ECR_REGISTRY/gitops-demo-frontend
+    tag: REPLACE_ME
