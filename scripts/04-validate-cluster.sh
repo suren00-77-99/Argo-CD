@@ -4,7 +4,7 @@ set -euo pipefail
 : "${CLUSTER_NAME:?Set CLUSTER_NAME}"
 : "${AWS_REGION:?Set AWS_REGION}"
 
-aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+aws eks update-kubeconfig --name "suren-eks-cluster" --region "ap-south-1"
 
 echo "=== Cluster ==="
 kubectl cluster-info

@@ -5,7 +5,7 @@ metadata:
   namespace: argocd
 spec:
   sourceRepos:
-    - YOUR_GITOPS_REPO_URL
+    - https://github.com/suren00-77-99/Argo-CD.git
   destinations:
     - namespace: gitops-demo
       server: https://kubernetes.default.svc

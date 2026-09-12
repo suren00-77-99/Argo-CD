@@ -6,32 +6,32 @@ set -euo pipefail
 : "${EBS_ROLE_ARN:?Set EBS_ROLE_ARN}"
 : "${EFS_ROLE_ARN:?Set EFS_ROLE_ARN}"
 
-aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+aws eks update-kubeconfig --name "suren-eks-cluster" --region "ap-south-1"
 
 aws eks create-addon \
-  --cluster-name "$CLUSTER_NAME" \
+  --cluster-name "suren-eks-cluster" \
   --addon-name aws-ebs-csi-driver \
-  --service-account-role-arn "$EBS_ROLE_ARN" \
+  --service-account-role-arn "arn:aws:iam::322686612450:role/eks-cluster-AmazonEKS_EBS_CSI_DriverRoleroot" \
   --resolve-conflicts OVERWRITE || \
 aws eks update-addon \
-  --cluster-name "$CLUSTER_NAME" \
+  --cluster-name "suren-eks-cluster" \
   --addon-name aws-ebs-csi-driver \
-  --service-account-role-arn "$EBS_ROLE_ARN" \
+  --service-account-role-arn "arn:aws:iam::322686612450:role/eks-cluster-AmazonEKS_EBS_CSI_DriverRoleroot" \
   --resolve-conflicts OVERWRITE
 
 # EFS CSI is commonly installed as the AWS EFS CSI managed add-on where supported.
 aws eks create-addon \
-  --cluster-name "$CLUSTER_NAME" \
+  --cluster-name "suren-eks-cluster" \
   --addon-name aws-efs-csi-driver \
   --service-account-role-arn "$EFS_ROLE_ARN" \
   --resolve-conflicts OVERWRITE || \
 aws eks update-addon \
-  --cluster-name "$CLUSTER_NAME" \
+  --cluster-name "suren-eks-cluster" \
   --addon-name aws-efs-csi-driver \
   --service-account-role-arn "$EFS_ROLE_ARN" \
   --resolve-conflicts OVERWRITE
 
-aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name aws-ebs-csi-driver \
+aws eks describe-addon --cluster-name "suren-eks-cluster" --addon-name aws-ebs-csi-driver \
   --query 'addon.status' --output text
-aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name aws-efs-csi-driver \
+aws eks describe-addon --cluster-name "suren-eks-cluster" --addon-name aws-efs-csi-driver \
   --query 'addon.status' --output text

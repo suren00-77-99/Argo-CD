@@ -6,7 +6,7 @@ metadata:
 spec:
   project: gitops-demo
   source:
-    repoURL: YOUR_GITOPS_REPO_URL
+    repoURL: https://github.com/suren00-77-99/Argo-CD.git
     targetRevision: main
     path: helm/gitops-demo
     helm:

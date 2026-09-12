@@ -8,4 +8,4 @@ spec:
   ports:
     - port: {{ .Values.frontend.service.port }}
       targetPort: {{ .Values.frontend.containerPort }}
-  type: ClusterIP
+  type: LoadBalancer
