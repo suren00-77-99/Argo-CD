@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Run after exporting:
-# CLUSTER_NAME=your-eks-cluster
-# AWS_REGION=ap-south-1
+CLUSTER_NAME=suren-eks-cluster
+AWS_REGION=ap-south-1
 #
 # This script creates IAM service accounts with IRSA for EBS/EFS CSI drivers.
 # It does NOT hard-code your ARN. The generated ARN is printed by eksctl.
