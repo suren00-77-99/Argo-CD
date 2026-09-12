@@ -1,4 +1,4 @@
 backend:
   image:
     repository: 322686612450.dkr.ecr.ap-south-1.amazonaws.com/gitops-demo-backend
-    tag: latest
+    tag: c2aeafc9e670
