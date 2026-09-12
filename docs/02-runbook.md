@@ -3,7 +3,7 @@
 ## 1. Configure variables
 
 ```bash
-export CLUSTER_NAME=gitops-demo
+export CLUSTER_NAME=suren-eks-cluster
 export AWS_REGION=ap-south-1
 export EBS_ROLE_ARN=arn:aws:iam::123456789012:role/REPLACE_EBS_ROLE
 export EFS_ROLE_ARN=arn:aws:iam::123456789012:role/REPLACE_EFS_ROLE
