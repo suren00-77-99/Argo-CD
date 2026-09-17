@@ -19,61 +19,59 @@ permissions:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  AWS_GITHUB_ROLE_ARN: ${{ vars.AWS_GITHUB_ROLE_ARN }}
+  AWS_GITHUB_CD_ROLE_ARN: ${{ vars.AWS_GITHUB_CD_ROLE_ARN }}
 
   EKS_CLUSTER_NAME: suren-eks-cluster
   APP_NAMESPACE: dev
 
 jobs:
   deploy:
-    name: Deploy GitOps Application
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------------------------------------
-      # 1. Checkout GitOps repository
-      # ---------------------------------------------
-      - name: Checkout repository
+      # --------------------------------------------------
+      # 1. Checkout source code
+      # --------------------------------------------------
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-      # ---------------------------------------------
-      # 2. Configure AWS using OIDC
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 2. Configure AWS credentials using GitHub OIDC
+      # --------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_GITHUB_CD_ROLE_ARN }}
-          aws-region: ap-south-1
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Update kubeconfig
+      # --------------------------------------------------
+      # 3. Verify AWS identity
+      # --------------------------------------------------
+      - name: Verify AWS identity
         run: |
-          aws eks update-kubeconfig \
-            --region ap-south-1 \
-            --name suren-eks-cluster
+          set -e
 
-      - name: Verify cluster access
-        run: |
-          kubectl get nodes
+          aws sts get-caller-identity
 
-      # ---------------------------------------------
-      # 3. Install kubectl
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 4. Install kubectl
+      # --------------------------------------------------
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: latest
 
-      # ---------------------------------------------
-      # 4. Install Helm
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 5. Install Helm
+      # --------------------------------------------------
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.15.4
 
-      # ---------------------------------------------
-      # 5. Configure EKS kubeconfig
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 6. Configure EKS kubeconfig
+      # --------------------------------------------------
       - name: Configure EKS kubeconfig
         run: |
           set -e
@@ -84,9 +82,9 @@ jobs:
 
           kubectl cluster-info
 
-      # ---------------------------------------------
-      # 6. Verify EKS nodes
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 7. Verify EKS nodes
+      # --------------------------------------------------
       - name: Verify EKS nodes
         run: |
           set -e
@@ -101,10 +99,11 @@ jobs:
           fi
 
           echo "EKS cluster is reachable"
+          echo "Node count: $NODE_COUNT"
 
-      # ---------------------------------------------
-      # 7. Create application namespace
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 8. Create application namespace
+      # --------------------------------------------------
       - name: Create application namespace
         run: |
           set -e
@@ -115,9 +114,9 @@ jobs:
 
           echo "Namespace $APP_NAMESPACE is ready"
 
-      # ---------------------------------------------
-      # 8. Install Argo CD if not installed
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 9. Install Argo CD if not installed
+      # --------------------------------------------------
       - name: Install Argo CD
         run: |
           set -e
@@ -150,9 +149,9 @@ jobs:
 
           echo "Argo CD is ready"
 
-      # ---------------------------------------------
-      # 9. Apply Argo CD project
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 10. Apply Argo CD project
+      # --------------------------------------------------
       - name: Apply Argo CD project
         run: |
           set -e
@@ -162,9 +161,9 @@ jobs:
 
           echo "Argo CD project applied"
 
-      # ---------------------------------------------
-      # 10. Apply Argo CD application
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 11. Apply Argo CD application
+      # --------------------------------------------------
       - name: Apply Argo CD application
         run: |
           set -e
@@ -174,16 +173,20 @@ jobs:
 
           echo "Argo CD application applied"
 
-      # ---------------------------------------------
-      # 11. Get Argo CD application name
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 12. Get Argo CD application name
+      # --------------------------------------------------
       - name: Get Argo CD application name
         id: app
         run: |
           set -e
 
           APP_NAME=$(awk '
-            /^metadata:/ { in_metadata=1 }
+            /^metadata:/ {
+              in_metadata=1
+              next
+            }
+
             in_metadata && /^  name:/ {
               print $2
               exit
@@ -199,9 +202,9 @@ jobs:
 
           echo "name=$APP_NAME" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------
-      # 12. Wait for Argo CD synchronization
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 13. Wait for Argo CD synchronization
+      # --------------------------------------------------
       - name: Wait for Argo CD synchronization
         run: |
           set -e
@@ -238,9 +241,9 @@ jobs:
 
           exit 1
 
-      # ---------------------------------------------
-      # 13. Verify Kubernetes deployments
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 14. Verify application deployments
+      # --------------------------------------------------
       - name: Verify application deployments
         run: |
           set -e
@@ -259,9 +262,9 @@ jobs:
           kubectl get services \
             -n "$APP_NAMESPACE"
 
-      # ---------------------------------------------
-      # 14. Verify frontend deployment
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 15. Verify frontend deployment
+      # --------------------------------------------------
       - name: Verify frontend deployment
         run: |
           set -e
@@ -279,9 +282,9 @@ jobs:
             exit 1
           fi
 
-      # ---------------------------------------------
-      # 15. Verify backend deployment
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 16. Verify backend deployment
+      # --------------------------------------------------
       - name: Verify backend deployment
         run: |
           set -e
@@ -299,14 +302,20 @@ jobs:
             exit 1
           fi
 
-      # ---------------------------------------------
-      # 16. Display final status
-      # ---------------------------------------------
+      # --------------------------------------------------
+      # 17. Display final deployment status
+      # --------------------------------------------------
       - name: Display final deployment status
         run: |
+          set -e
+
           echo "======================================"
           echo "FINAL DEPLOYMENT STATUS"
           echo "======================================"
+
+          echo ""
+          echo "AWS Identity:"
+          aws sts get-caller-identity
 
           echo ""
           echo "EKS Nodes:"
@@ -314,15 +323,19 @@ jobs:
 
           echo ""
           echo "Application Pods:"
-          kubectl get pods -n "$APP_NAMESPACE" -o wide
+          kubectl get pods \
+            -n "$APP_NAMESPACE" \
+            -o wide
 
           echo ""
           echo "Application Services:"
-          kubectl get svc -n "$APP_NAMESPACE"
+          kubectl get svc \
+            -n "$APP_NAMESPACE"
 
           echo ""
           echo "Argo CD Applications:"
-          kubectl get applications -n argocd
+          kubectl get applications \
+            -n argocd
 
           echo ""
           echo "CD pipeline completed successfully"
