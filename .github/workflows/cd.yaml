@@ -144,7 +144,7 @@ jobs:
   ingress-controller:
     name: 3. Install NGINX Ingress
     runs-on: ubuntu-latest
-    needs: ebs-addon
+    needs: deploy
 
     steps:
       - name: Configure AWS credentials
