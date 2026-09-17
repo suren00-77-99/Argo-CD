@@ -1,6 +1,9 @@
 name: CD - EKS Deployment
 
 on:
+  push:
+    branches: [main]
+    
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,7 @@ env:
   UI_IMAGE_REPOSITORY: ${{ vars.ECR_REGISTRY }}/ui
 
   # Image tag passed from CI
-  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_TAG: latest
 
 jobs:
 
@@ -32,6 +35,38 @@ jobs:
   cluster-validate:
     name: 1. Cluster Validate
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required variables
+        run: |
+          set -e
+
+          if [ -z "$AWS_GITHUB_CD_ROLE_ARN" ]; then
+            echo "ERROR: AWS_GITHUB_CD_ROLE_ARN is empty"
+            exit 1
+          fi
+
+          if [ -z "$EKS_CLUSTER_NAME" ]; then
+            echo "ERROR: EKS_CLUSTER_NAME is empty"
+            exit 1
+          fi
+
+          if [ -z "$APP_NAMESPACE" ]; then
+            echo "ERROR: APP_NAMESPACE is empty"
+            exit 1
+          fi
+
+          if [ -z "$UI_IMAGE_REPOSITORY" ] || [ "$UI_IMAGE_REPOSITORY" = "/ui" ]; then
+            echo "ERROR: UI_IMAGE_REPOSITORY is invalid"
+            exit 1
+          fi
+
+          echo "AWS Region: $AWS_REGION"
+          echo "EKS Cluster: $EKS_CLUSTER_NAME"
+          echo "Namespace: $APP_NAMESPACE"
+          echo "UI Image Repository: $UI_IMAGE_REPOSITORY"
 
     outputs:
       cluster_ready: ${{ steps.validate.outputs.cluster_ready }}
