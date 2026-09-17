@@ -1,341 +1,497 @@
-name: CD - Deploy to EKS
+name: CD - EKS Deployment
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "argocd/**"
-      - "environments/**"
-      - "helm/**"
-      - "scripts/**"
-      - ".github/workflows/cd.yml"
-
   workflow_dispatch:
 
 permissions:
-  contents: read
   id-token: write
+  contents: read
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_GITHUB_CD_ROLE_ARN: ${{ vars.AWS_GITHUB_CD_ROLE_ARN }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  APP_NAMESPACE: ${{ vars.APP_NAMESPACE }}
 
-  EKS_CLUSTER_NAME: suren-eks-cluster
-  APP_NAMESPACE: dev
+  # Change these according to your project
+  UI_RELEASE_NAME: ui
+  UI_CHART_PATH: helm/ui
+
+  # ECR image repository
+  UI_IMAGE_REPOSITORY: ${{ vars.ECR_REGISTRY }}/ui
+
+  # Image tag passed from CI
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  deploy:
+
+  # ============================================================
+  # STAGE 1: CLUSTER VALIDATION
+  # ============================================================
+
+  cluster-validate:
+    name: 1. Cluster Validate
     runs-on: ubuntu-latest
 
+    outputs:
+      cluster_ready: ${{ steps.validate.outputs.cluster_ready }}
+
     steps:
-      # --------------------------------------------------
-      # 1. Checkout source code
-      # --------------------------------------------------
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # 2. Configure AWS credentials using GitHub OIDC
-      # --------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: ${{ vars.AWS_GITHUB_CD_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
 
-      # --------------------------------------------------
-      # 3. Verify AWS identity
-      # --------------------------------------------------
       - name: Verify AWS identity
         run: |
-          set -e
-
           aws sts get-caller-identity
 
-      # --------------------------------------------------
-      # 4. Install kubectl
-      # --------------------------------------------------
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: latest
 
-      # --------------------------------------------------
-      # 5. Install Helm
-      # --------------------------------------------------
       - name: Install Helm
         uses: azure/setup-helm@v4
-        with:
-          version: v3.15.4
 
-      # --------------------------------------------------
-      # 6. Configure EKS kubeconfig
-      # --------------------------------------------------
-      - name: Configure EKS kubeconfig
+      - name: Update kubeconfig
         run: |
-          set -e
-
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER_NAME"
 
-          kubectl cluster-info
-
-      # --------------------------------------------------
-      # 7. Verify EKS nodes
-      # --------------------------------------------------
-      - name: Verify EKS nodes
+      - name: Validate EKS cluster
+        id: validate
         run: |
           set -e
 
-          kubectl get nodes -o wide
+          echo "Checking EKS cluster..."
 
-          NODE_COUNT=$(kubectl get nodes --no-headers | wc -l)
+          aws eks describe-cluster \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME" \
+            --query 'cluster.status' \
+            --output text
 
-          if [ "$NODE_COUNT" -lt 1 ]; then
-            echo "No EKS nodes found"
-            exit 1
+          echo "Checking Kubernetes nodes..."
+
+          kubectl get nodes
+
+          echo "Checking Kubernetes version..."
+
+          kubectl version --short 2>/dev/null || kubectl version
+
+          echo "Checking namespaces..."
+
+          kubectl get namespaces
+
+          echo "Cluster validation successful."
+
+          echo "cluster_ready=true" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # STAGE 2: EBS CSI DRIVER
+  # ============================================================
+
+  ebs-addon:
+    name: 2. Install EBS CSI Add-on
+    runs-on: ubuntu-latest
+    needs: cluster-validate
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install EBS CSI Driver add-on
+        run: |
+          set -e
+
+          echo "Checking EBS CSI add-on..."
+
+          ADDON_STATUS=$(aws eks describe-addon \
+            --cluster-name "$EKS_CLUSTER_NAME" \
+            --addon-name aws-ebs-csi-driver \
+            --region "$AWS_REGION" \
+            --query 'addon.status' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          echo "Current status: $ADDON_STATUS"
+
+          if [ "$ADDON_STATUS" = "NOT_FOUND" ]; then
+            echo "Installing EBS CSI Driver..."
+
+            aws eks create-addon \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --resolve-conflicts OVERWRITE \
+              --region "$AWS_REGION"
+          else
+            echo "EBS CSI Driver already exists."
           fi
 
-          echo "EKS cluster is reachable"
-          echo "Node count: $NODE_COUNT"
+          echo "Waiting for EBS CSI Driver..."
 
-      # --------------------------------------------------
-      # 8. Create application namespace
-      # --------------------------------------------------
+          aws eks wait addon-active \
+            --cluster-name "$EKS_CLUSTER_NAME" \
+            --addon-name aws-ebs-csi-driver \
+            --region "$AWS_REGION"
+
+          echo "EBS CSI Driver is active."
+
+  # ============================================================
+  # STAGE 3: NGINX INGRESS CONTROLLER
+  # ============================================================
+
+  ingress-controller:
+    name: 3. Install NGINX Ingress
+    runs-on: ubuntu-latest
+    needs: ebs-addon
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Add ingress-nginx Helm repository
+        run: |
+          helm repo add ingress-nginx \
+            https://kubernetes.github.io/ingress-nginx
+
+          helm repo update
+
+      - name: Install NGINX Ingress Controller
+        run: |
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx \
+            --create-namespace \
+            --set controller.service.type=LoadBalancer \
+            --wait \
+            --timeout 10m
+
+      - name: Validate Ingress Controller
+        run: |
+          kubectl get pods -n ingress-nginx
+          kubectl get svc -n ingress-nginx
+
+  # ============================================================
+  # STAGE 4: CERT-MANAGER
+  # ============================================================
+
+  cert-manager:
+    name: 4. Install cert-manager
+    runs-on: ubuntu-latest
+    needs: ingress-controller
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Add Jetstack Helm repository
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+
+      - name: Install cert-manager
+        run: |
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --set crds.enabled=true \
+            --wait \
+            --timeout 10m
+
+      - name: Validate cert-manager
+        run: |
+          kubectl get pods -n cert-manager
+          kubectl get crd | grep cert-manager
+
+  # ============================================================
+  # STAGE 5: HELM VALIDATION
+  # ============================================================
+
+  helm-validation:
+    name: 5. Helm Installation / Validation
+    runs-on: ubuntu-latest
+    needs: cert-manager
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Validate Helm installation
+        run: |
+          helm version
+          helm env
+
+      - name: Validate UI Helm chart
+        run: |
+          helm lint "$UI_CHART_PATH"
+
+          helm template "$UI_RELEASE_NAME" "$UI_CHART_PATH" \
+            --namespace "$APP_NAMESPACE" \
+            --set image.repository="$UI_IMAGE_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG"
+
+  # ============================================================
+  # STAGE 6: ARGOCD INSTALLATION
+  # ============================================================
+
+  argocd-install:
+    name: 6. Install ArgoCD
+    runs-on: ubuntu-latest
+    needs: helm-validation
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Add ArgoCD Helm repository
+        run: |
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+
+      - name: Install ArgoCD
+        run: |
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd \
+            --create-namespace \
+            --set server.service.type=ClusterIP \
+            --wait \
+            --timeout 15m
+
+      - name: Validate ArgoCD
+        run: |
+          kubectl get pods -n argocd
+          kubectl get svc -n argocd
+
+  # ============================================================
+  # STAGE 7: EXPOSE ARGOCD PORT
+  # ============================================================
+
+  argocd-expose:
+    name: 7. Expose ArgoCD Port
+    runs-on: ubuntu-latest
+    needs: argocd-install
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Expose ArgoCD using LoadBalancer
+        run: |
+          kubectl patch svc argocd-server \
+            -n argocd \
+            -p '{"spec":{"type":"LoadBalancer"}}'
+
+      - name: Wait for ArgoCD external address
+        run: |
+          for i in {1..30}; do
+            ADDRESS=$(kubectl get svc argocd-server \
+              -n argocd \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+            if [ -n "$ADDRESS" ]; then
+              echo "ArgoCD URL: https://$ADDRESS"
+              break
+            fi
+
+            echo "Waiting for LoadBalancer..."
+            sleep 20
+          done
+
+      - name: Display ArgoCD service
+        run: |
+          kubectl get svc argocd-server -n argocd
+
+  # ============================================================
+  # STAGE 8: DEPLOY UI IMAGE USING HELM
+  # ============================================================
+
+  deploy-ui:
+    name: 8. Deploy UI Image Using Helm
+    runs-on: ubuntu-latest
+    needs: argocd-expose
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
       - name: Create application namespace
         run: |
-          set -e
-
           kubectl create namespace "$APP_NAMESPACE" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
-          echo "Namespace $APP_NAMESPACE is ready"
-
-      # --------------------------------------------------
-      # 9. Install Argo CD if not installed
-      # --------------------------------------------------
-      - name: Install Argo CD
+      - name: Deploy UI using Helm
         run: |
-          set -e
+          helm upgrade --install "$UI_RELEASE_NAME" "$UI_CHART_PATH" \
+            --namespace "$APP_NAMESPACE" \
+            --create-namespace \
+            --set image.repository="$UI_IMAGE_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG" \
+            --wait \
+            --timeout 10m
 
-          kubectl create namespace argocd \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
-
-          if kubectl get deployment argocd-server -n argocd >/dev/null 2>&1; then
-            echo "Argo CD is already installed"
-          else
-            echo "Installing Argo CD"
-
-            kubectl apply \
-              -n argocd \
-              -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.3/manifests/install.yaml
-          fi
-
-          kubectl rollout status deployment/argocd-server \
-            -n argocd \
-            --timeout=600s
-
-          kubectl rollout status deployment/argocd-repo-server \
-            -n argocd \
-            --timeout=600s
-
-          kubectl rollout status statefulset/argocd-application-controller \
-            -n argocd \
-            --timeout=600s
-
-          echo "Argo CD is ready"
-
-      # --------------------------------------------------
-      # 10. Apply Argo CD project
-      # --------------------------------------------------
-      - name: Apply Argo CD project
+      - name: Validate UI deployment
         run: |
-          set -e
+          kubectl get pods -n "$APP_NAMESPACE"
+          kubectl get svc -n "$APP_NAMESPACE"
+          kubectl get ingress -n "$APP_NAMESPACE" || true
 
-          kubectl apply \
-            -f argocd/project.yaml
-
-          echo "Argo CD project applied"
-
-      # --------------------------------------------------
-      # 11. Apply Argo CD application
-      # --------------------------------------------------
-      - name: Apply Argo CD application
-        run: |
-          set -e
-
-          kubectl apply \
-            -f argocd/application.yaml
-
-          echo "Argo CD application applied"
-
-      # --------------------------------------------------
-      # 12. Get Argo CD application name
-      # --------------------------------------------------
-      - name: Get Argo CD application name
-        id: app
-        run: |
-          set -e
-
-          APP_NAME=$(awk '
-            /^metadata:/ {
-              in_metadata=1
-              next
-            }
-
-            in_metadata && /^  name:/ {
-              print $2
-              exit
-            }
-          ' argocd/application.yaml)
-
-          if [ -z "$APP_NAME" ]; then
-            echo "Could not find Argo CD application name"
-            exit 1
-          fi
-
-          echo "Argo CD application name: $APP_NAME"
-
-          echo "name=$APP_NAME" >> "$GITHUB_OUTPUT"
-
-      # --------------------------------------------------
-      # 13. Wait for Argo CD synchronization
-      # --------------------------------------------------
-      - name: Wait for Argo CD synchronization
-        run: |
-          set -e
-
-          APP_NAME="${{ steps.app.outputs.name }}"
-
-          echo "Waiting for Argo CD application: $APP_NAME"
-
-          for i in {1..60}; do
-            SYNC_STATUS=$(kubectl get application "$APP_NAME" \
-              -n argocd \
-              -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
-
-            HEALTH_STATUS=$(kubectl get application "$APP_NAME" \
-              -n argocd \
-              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
-
-            echo "Sync status: $SYNC_STATUS"
-            echo "Health status: $HEALTH_STATUS"
-
-            if [ "$SYNC_STATUS" = "Synced" ] && [ "$HEALTH_STATUS" = "Healthy" ]; then
-              echo "Application is Synced and Healthy"
-              exit 0
-            fi
-
-            sleep 10
-          done
-
-          echo "Application did not become healthy"
-
-          kubectl get application "$APP_NAME" \
-            -n argocd \
-            -o yaml
-
-          exit 1
-
-      # --------------------------------------------------
-      # 14. Verify application deployments
-      # --------------------------------------------------
-      - name: Verify application deployments
-        run: |
-          set -e
-
-          echo "Deployments:"
-          kubectl get deployments \
+          kubectl rollout status deployment/"$UI_RELEASE_NAME" \
             -n "$APP_NAMESPACE" \
-            -o wide
+            --timeout=5m
 
-          echo "Pods:"
-          kubectl get pods \
-            -n "$APP_NAMESPACE" \
-            -o wide
+  # ============================================================
+  # STAGE 9: FINAL VALIDATION
+  # ============================================================
 
-          echo "Services:"
-          kubectl get services \
-            -n "$APP_NAMESPACE"
+  final-validation:
+    name: 9. Final Deployment Validation
+    runs-on: ubuntu-latest
+    needs: deploy-ui
 
-      # --------------------------------------------------
-      # 15. Verify frontend deployment
-      # --------------------------------------------------
-      - name: Verify frontend deployment
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Update kubeconfig
         run: |
-          set -e
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
 
-          if kubectl get deployment frontend \
-            -n "$APP_NAMESPACE" >/dev/null 2>&1; then
-
-            kubectl rollout status deployment/frontend \
-              -n "$APP_NAMESPACE" \
-              --timeout=600s
-
-          else
-            echo "Frontend deployment was not found"
-            kubectl get deployments -n "$APP_NAMESPACE"
-            exit 1
-          fi
-
-      # --------------------------------------------------
-      # 16. Verify backend deployment
-      # --------------------------------------------------
-      - name: Verify backend deployment
+      - name: Final validation
         run: |
-          set -e
-
-          if kubectl get deployment backend \
-            -n "$APP_NAMESPACE" >/dev/null 2>&1; then
-
-            kubectl rollout status deployment/backend \
-              -n "$APP_NAMESPACE" \
-              --timeout=600s
-
-          else
-            echo "Backend deployment was not found"
-            kubectl get deployments -n "$APP_NAMESPACE"
-            exit 1
-          fi
-
-      # --------------------------------------------------
-      # 17. Display final deployment status
-      # --------------------------------------------------
-      - name: Display final deployment status
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "FINAL DEPLOYMENT STATUS"
-          echo "======================================"
-
-          echo ""
-          echo "AWS Identity:"
-          aws sts get-caller-identity
-
-          echo ""
-          echo "EKS Nodes:"
+          echo "===== Nodes ====="
           kubectl get nodes
 
-          echo ""
-          echo "Application Pods:"
-          kubectl get pods \
-            -n "$APP_NAMESPACE" \
-            -o wide
+          echo "===== Ingress ====="
+          kubectl get pods -n ingress-nginx
 
-          echo ""
-          echo "Application Services:"
-          kubectl get svc \
-            -n "$APP_NAMESPACE"
+          echo "===== cert-manager ====="
+          kubectl get pods -n cert-manager
 
-          echo ""
-          echo "Argo CD Applications:"
-          kubectl get applications \
-            -n argocd
+          echo "===== ArgoCD ====="
+          kubectl get pods -n argocd
 
-          echo ""
-          echo "CD pipeline completed successfully"
+          echo "===== UI Application ====="
+          kubectl get all -n "$APP_NAMESPACE"
+
+          echo "===== Helm Releases ====="
+          helm list -A
+
+          echo "Deployment completed successfully."
