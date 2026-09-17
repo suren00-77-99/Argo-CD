@@ -157,87 +157,64 @@ jobs:
         run: |
           set -euo pipefail
 
-          ADDON_NAME="aws-ebs-csi-driver"
+          CLUSTER="suren-eks-cluster"
+          REGION="ap-south-1"
+          ACCOUNT_ID="322686612450"
+          ROLE_NAME="${CLUSTER}-AmazonEKS_EBS_CSI_DriverRole"
+          ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+          echo "Associating EKS OIDC provider..."
+
+          eksctl utils associate-iam-oidc-provider \
+            --cluster "$CLUSTER" \
+            --region "$REGION" \
+            --approve
+
+          echo "Creating or updating EBS CSI IAM service account..."
+
+          eksctl create iamserviceaccount \
+            --cluster "$CLUSTER" \
+            --region "$REGION" \
+            --namespace kube-system \
+            --name ebs-csi-controller-sa \
+            --role-name "$ROLE_NAME" \
+            --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+            --approve \
+            --override-existing-serviceaccounts
 
           echo "Checking EBS CSI add-on..."
 
-          STATUS="$(aws eks describe-addon \
-            --cluster-name "$EKS_CLUSTER_NAME" \
-            --addon-name "$ADDON_NAME" \
-            --region "$AWS_REGION" \
+          STATUS=$(aws eks describe-addon \
+            --cluster-name "$CLUSTER" \
+            --addon-name aws-ebs-csi-driver \
+            --region "$REGION" \
             --query 'addon.status' \
-            --output text 2>/dev/null || echo "NOT_FOUND")"
+            --output text 2>/dev/null || echo "NOT_FOUND")
 
-          echo "Current status: $STATUS"
+          echo "Current add-on status: $STATUS"
 
           if [ "$STATUS" = "NOT_FOUND" ]; then
-            echo "Installing EBS CSI Driver..."
+            echo "Add-on not found. Creating..."
 
             aws eks create-addon \
-              --cluster-name "$EKS_CLUSTER_NAME" \
-              --addon-name "$ADDON_NAME" \
-              --addon-version "v1.66.0-eksbuild.1" \
+              --cluster-name "$CLUSTER" \
+              --addon-name aws-ebs-csi-driver \
+              --service-account-role-arn "$ROLE_ARN" \
               --resolve-conflicts OVERWRITE \
-              --region "$AWS_REGION"
-          elif [ "$STATUS" = "ACTIVE" ]; then
-            echo "EBS CSI Driver is already ACTIVE."
-          elif [ "$STATUS" = "DEGRADED" ] || [ "$STATUS" = "CREATE_FAILED" ]; then
-            echo "EBS CSI Driver is in an unhealthy state."
-            aws eks describe-addon \
-              --cluster-name "$EKS_CLUSTER_NAME" \
-              --addon-name "$ADDON_NAME" \
-              --region "$AWS_REGION"
-            exit 1
+              --region "$REGION"
+
+          else
+            echo "Add-on exists. Updating..."
+
+            aws eks update-addon \
+              --cluster-name "$CLUSTER" \
+              --addon-name aws-ebs-csi-driver \
+              --service-account-role-arn "$ROLE_ARN" \
+              --resolve-conflicts OVERWRITE \
+              --region "$REGION"
           fi
 
-          echo "Waiting for EBS CSI Driver to become ACTIVE..."
-
-          for attempt in $(seq 1 30); do
-            STATUS="$(aws eks describe-addon \
-              --cluster-name "$EKS_CLUSTER_NAME" \
-              --addon-name "$ADDON_NAME" \
-              --region "$AWS_REGION" \
-              --query 'addon.status' \
-              --output text)"
-
-            echo "Attempt $attempt/30 - Status: $STATUS"
-
-            case "$STATUS" in
-              ACTIVE)
-                echo "EBS CSI Driver is ACTIVE."
-                exit 0
-                ;;
-              DEGRADED|CREATE_FAILED|DELETE_FAILED)
-                echo "EBS CSI Driver failed or became unhealthy."
-                aws eks describe-addon \
-                  --cluster-name "$EKS_CLUSTER_NAME" \
-                  --addon-name "$ADDON_NAME" \
-                  --region "$AWS_REGION"
-                exit 1
-                ;;
-              CREATING|UPDATING)
-                sleep 20
-                ;;
-              *)
-                echo "Unexpected status: $STATUS"
-                sleep 20
-                ;;
-            esac
-          done
-
-          echo "EBS CSI Driver did not become ACTIVE within the timeout."
-
-          aws eks describe-addon \
-            --cluster-name "$EKS_CLUSTER_NAME" \
-            --addon-name "$ADDON_NAME" \
-            --region "$AWS_REGION"
-
-          kubectl get pods -n kube-system | grep -i ebs || true
-          kubectl get events -n kube-system \
-            --sort-by=.lastTimestamp | tail -30 || true
-
-          exit 1
-
+          echo "EBS CSI add-on operation completed."
   # ============================================================
   # STAGE 3: NGINX INGRESS CONTROLLER
   # ============================================================
