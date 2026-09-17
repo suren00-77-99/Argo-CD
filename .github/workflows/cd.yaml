@@ -12,7 +12,7 @@ permissions:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
-  AWS_GITHUB_CD_ROLE_ARN: ${{ vars.AWS_GITHUB_CD_ROLE_ARN }}
+  AWS_GITHUB_CD_ROLE_ARN: ${{ vars.AWS_GITHUB_ROLE_ARN }}
   EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
   APP_NAMESPACE: ${{ vars.APP_NAMESPACE }}
 
