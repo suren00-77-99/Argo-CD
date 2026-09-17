@@ -1,0 +1,319 @@
+name: CD - Deploy to EKS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "argocd/**"
+      - "environments/**"
+      - "helm/**"
+      - "scripts/**"
+      - ".github/workflows/cd.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_GITHUB_ROLE_ARN: ${{ vars.AWS_GITHUB_ROLE_ARN }}
+
+  EKS_CLUSTER_NAME: suren-eks-cluster
+  APP_NAMESPACE: dev
+
+jobs:
+  deploy:
+    name: Deploy GitOps Application
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---------------------------------------------
+      # 1. Checkout GitOps repository
+      # ---------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------
+      # 2. Configure AWS using OIDC
+      # ---------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-CD
+
+      # ---------------------------------------------
+      # 3. Install kubectl
+      # ---------------------------------------------
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      # ---------------------------------------------
+      # 4. Install Helm
+      # ---------------------------------------------
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      # ---------------------------------------------
+      # 5. Configure EKS kubeconfig
+      # ---------------------------------------------
+      - name: Configure EKS kubeconfig
+        run: |
+          set -e
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+          kubectl cluster-info
+
+      # ---------------------------------------------
+      # 6. Verify EKS nodes
+      # ---------------------------------------------
+      - name: Verify EKS nodes
+        run: |
+          set -e
+
+          kubectl get nodes -o wide
+
+          NODE_COUNT=$(kubectl get nodes --no-headers | wc -l)
+
+          if [ "$NODE_COUNT" -lt 1 ]; then
+            echo "No EKS nodes found"
+            exit 1
+          fi
+
+          echo "EKS cluster is reachable"
+
+      # ---------------------------------------------
+      # 7. Create application namespace
+      # ---------------------------------------------
+      - name: Create application namespace
+        run: |
+          set -e
+
+          kubectl create namespace "$APP_NAMESPACE" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+          echo "Namespace $APP_NAMESPACE is ready"
+
+      # ---------------------------------------------
+      # 8. Install Argo CD if not installed
+      # ---------------------------------------------
+      - name: Install Argo CD
+        run: |
+          set -e
+
+          kubectl create namespace argocd \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+          if kubectl get deployment argocd-server -n argocd >/dev/null 2>&1; then
+            echo "Argo CD is already installed"
+          else
+            echo "Installing Argo CD"
+
+            kubectl apply \
+              -n argocd \
+              -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.3/manifests/install.yaml
+          fi
+
+          kubectl rollout status deployment/argocd-server \
+            -n argocd \
+            --timeout=600s
+
+          kubectl rollout status deployment/argocd-repo-server \
+            -n argocd \
+            --timeout=600s
+
+          kubectl rollout status statefulset/argocd-application-controller \
+            -n argocd \
+            --timeout=600s
+
+          echo "Argo CD is ready"
+
+      # ---------------------------------------------
+      # 9. Apply Argo CD project
+      # ---------------------------------------------
+      - name: Apply Argo CD project
+        run: |
+          set -e
+
+          kubectl apply \
+            -f argocd/project.yaml
+
+          echo "Argo CD project applied"
+
+      # ---------------------------------------------
+      # 10. Apply Argo CD application
+      # ---------------------------------------------
+      - name: Apply Argo CD application
+        run: |
+          set -e
+
+          kubectl apply \
+            -f argocd/application.yaml
+
+          echo "Argo CD application applied"
+
+      # ---------------------------------------------
+      # 11. Get Argo CD application name
+      # ---------------------------------------------
+      - name: Get Argo CD application name
+        id: app
+        run: |
+          set -e
+
+          APP_NAME=$(awk '
+            /^metadata:/ { in_metadata=1 }
+            in_metadata && /^  name:/ {
+              print $2
+              exit
+            }
+          ' argocd/application.yaml)
+
+          if [ -z "$APP_NAME" ]; then
+            echo "Could not find Argo CD application name"
+            exit 1
+          fi
+
+          echo "Argo CD application name: $APP_NAME"
+
+          echo "name=$APP_NAME" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------
+      # 12. Wait for Argo CD synchronization
+      # ---------------------------------------------
+      - name: Wait for Argo CD synchronization
+        run: |
+          set -e
+
+          APP_NAME="${{ steps.app.outputs.name }}"
+
+          echo "Waiting for Argo CD application: $APP_NAME"
+
+          for i in {1..60}; do
+            SYNC_STATUS=$(kubectl get application "$APP_NAME" \
+              -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+
+            HEALTH_STATUS=$(kubectl get application "$APP_NAME" \
+              -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+
+            echo "Sync status: $SYNC_STATUS"
+            echo "Health status: $HEALTH_STATUS"
+
+            if [ "$SYNC_STATUS" = "Synced" ] && [ "$HEALTH_STATUS" = "Healthy" ]; then
+              echo "Application is Synced and Healthy"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Application did not become healthy"
+
+          kubectl get application "$APP_NAME" \
+            -n argocd \
+            -o yaml
+
+          exit 1
+
+      # ---------------------------------------------
+      # 13. Verify Kubernetes deployments
+      # ---------------------------------------------
+      - name: Verify application deployments
+        run: |
+          set -e
+
+          echo "Deployments:"
+          kubectl get deployments \
+            -n "$APP_NAMESPACE" \
+            -o wide
+
+          echo "Pods:"
+          kubectl get pods \
+            -n "$APP_NAMESPACE" \
+            -o wide
+
+          echo "Services:"
+          kubectl get services \
+            -n "$APP_NAMESPACE"
+
+      # ---------------------------------------------
+      # 14. Verify frontend deployment
+      # ---------------------------------------------
+      - name: Verify frontend deployment
+        run: |
+          set -e
+
+          if kubectl get deployment frontend \
+            -n "$APP_NAMESPACE" >/dev/null 2>&1; then
+
+            kubectl rollout status deployment/frontend \
+              -n "$APP_NAMESPACE" \
+              --timeout=600s
+
+          else
+            echo "Frontend deployment was not found"
+            kubectl get deployments -n "$APP_NAMESPACE"
+            exit 1
+          fi
+
+      # ---------------------------------------------
+      # 15. Verify backend deployment
+      # ---------------------------------------------
+      - name: Verify backend deployment
+        run: |
+          set -e
+
+          if kubectl get deployment backend \
+            -n "$APP_NAMESPACE" >/dev/null 2>&1; then
+
+            kubectl rollout status deployment/backend \
+              -n "$APP_NAMESPACE" \
+              --timeout=600s
+
+          else
+            echo "Backend deployment was not found"
+            kubectl get deployments -n "$APP_NAMESPACE"
+            exit 1
+          fi
+
+      # ---------------------------------------------
+      # 16. Display final status
+      # ---------------------------------------------
+      - name: Display final deployment status
+        run: |
+          echo "======================================"
+          echo "FINAL DEPLOYMENT STATUS"
+          echo "======================================"
+
+          echo ""
+          echo "EKS Nodes:"
+          kubectl get nodes
+
+          echo ""
+          echo "Application Pods:"
+          kubectl get pods -n "$APP_NAMESPACE" -o wide
+
+          echo ""
+          echo "Application Services:"
+          kubectl get svc -n "$APP_NAMESPACE"
+
+          echo ""
+          echo "Argo CD Applications:"
+          kubectl get applications -n argocd
+
+          echo ""
+          echo "CD pipeline completed successfully"
