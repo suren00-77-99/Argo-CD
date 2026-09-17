@@ -27,51 +27,22 @@ env:
   IMAGE_TAG: latest
 
 jobs:
-
-  # ============================================================
-  # STAGE 1: CLUSTER VALIDATION
-  # ============================================================
-
-  cluster-validate:
-    name: 1. Cluster Validate
+  deploy:
     runs-on: ubuntu-latest
 
-    outputs:
-      cluster_ready: ${{ steps.validate.outputs.cluster_ready }}
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      AWS_GITHUB_CD_ROLE_ARN: arn:aws:iam::322686612450:role/GitHubActions-CD-Role
+      EKS_CLUSTER_NAME: suren-eks-cluster
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required variables
-        run: |
-          set -e
-
-          if [ -z "$AWS_GITHUB_CD_ROLE_ARN" ]; then
-            echo "ERROR: AWS_GITHUB_CD_ROLE_ARN is empty"
-            exit 1
-          fi
-
-          if [ -z "$EKS_CLUSTER_NAME" ]; then
-            echo "ERROR: EKS_CLUSTER_NAME is empty"
-            exit 1
-          fi
-
-          if [ -z "$APP_NAMESPACE" ]; then
-            echo "ERROR: APP_NAMESPACE is empty"
-            exit 1
-          fi
-
-          if [ -z "$UI_IMAGE_REPOSITORY" ] || [ "$UI_IMAGE_REPOSITORY" = "/ui" ]; then
-            echo "ERROR: UI_IMAGE_REPOSITORY is invalid"
-            exit 1
-          fi
-
-          echo "AWS Region: $AWS_REGION"
-          echo "EKS Cluster: $EKS_CLUSTER_NAME"
-          echo "Namespace: $APP_NAMESPACE"
-          echo "UI Image Repository: $UI_IMAGE_REPOSITORY"
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -79,87 +50,39 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
 
-      - name: Verify AWS identity
-        run: |
-          aws sts get-caller-identity
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: latest
-
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
-
-      - name: Validate EKS cluster
-        run: |
-          set -e
-
-          echo "Checking EKS cluster..."
-
-          aws eks describe-cluster \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME" \
-            --query 'cluster.status' \
-            --output text
-
-          echo "Checking AWS identity..."
-
-          aws sts get-caller-identity
-
-          echo "Updating kubeconfig..."
-
-          aws eks update-kubeconfig \
-            --region "$AWS_REGION" \
-            --name "$EKS_CLUSTER_NAME"
-
-          echo "Checking Kubernetes nodes..."
-
-          kubectl get nodes
-
-          echo "Checking Kubernetes version..."
-
-          kubectl version --short 2>/dev/null || kubectl version
-
-          echo "Checking namespaces..."
-
-          kubectl get namespaces
-
-          echo "Cluster validation successful."
-
-          echo "cluster_ready=true" >> "$GITHUB_OUTPUT"
-
-  # ============================================================
-  # STAGE 2: EBS CSI DRIVER
-  # ============================================================
-
-  ebs-addon:
-    name: 2. Install EBS CSI Add-on
-    runs-on: ubuntu-latest
-    needs: cluster-validate
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.AWS_GITHUB_CD_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          audience: sts.amazonaws.com
-
-      - name: Install and wait for EBS CSI Driver
+      - name: Install eksctl
         shell: bash
         run: |
           set -euo pipefail
 
-          CLUSTER="suren-eks-cluster"
-          REGION="ap-south-1"
+          ARCH=$(uname -m)
+
+          if [ "$ARCH" = "x86_64" ]; then
+            ARCH="amd64"
+          elif [ "$ARCH" = "aarch64" ]; then
+            ARCH="arm64"
+          else
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error --location \
+            "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_${ARCH}.tar.gz" \
+            | tar -xz -C /tmp
+
+          sudo install -m 0755 /tmp/eksctl /usr/local/bin/eksctl
+
+          eksctl version
+
+      - name: Configure OIDC and EBS CSI Driver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER="${EKS_CLUSTER_NAME}"
+          REGION="${AWS_REGION}"
           ACCOUNT_ID="322686612450"
+
           ROLE_NAME="${CLUSTER}-AmazonEKS_EBS_CSI_DriverRole"
           ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
@@ -202,9 +125,8 @@ jobs:
               --service-account-role-arn "$ROLE_ARN" \
               --resolve-conflicts OVERWRITE \
               --region "$REGION"
-
           else
-            echo "Add-on exists. Updating..."
+            echo "Add-on exists with status: $STATUS. Updating..."
 
             aws eks update-addon \
               --cluster-name "$CLUSTER" \
